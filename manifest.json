@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "SHOWROOM フォローオンライブ同期",
+  "version": "1.4.1",
+  "description": "フォロー中配信を開き、2秒ずつ巡回し、終了タブを閉じる",
+  "icons": {
+    "16": "img/icon.png",
+    "48": "img/icon.png",
+    "128": "img/icon.png"
+  },
+  "action": {
+    "default_icon": "img/icon.png",
+    "default_popup": "popup.html",
+    "default_title": "SHOWROOM フォローオンライブ同期"
+  },
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "permissions": ["tabs", "storage", "offscreen"],
+  "host_permissions": ["https://www.showroom-live.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://www.showroom-live.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
