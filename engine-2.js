@@ -53,18 +53,15 @@ async function syncRooms() {
   state.ignoreList = state.ignoreList.filter((x) => liveKeys.has(typeof x === "string" ? x : x.key));
   Object.keys(state.watchMs).forEach((k) => { if (!liveKeys.has(k)) delete state.watchMs[k]; });
   const dupClosed = await closeDuplicateRoomTabs();
-  const tabs = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*", "https://*.showroom-live.com/*"] });
-  const openKeys = new Map();
-  for (const tab of tabs) {
-    const key = parseRoomKey(tab.url || "");
-    if (key) openKeys.set(key, tab);
-  }
+  const openKeys = await currentOpenKeys();
   let opened = 0;
   let closed = dupClosed;
   let ignoredIn = 0;
   let ignoredOut = 0;
   if (s.closeEnabled) {
     for (const [key, tab] of openKeys) {
+      // 読み込み中は「終了」判定しない。url がまだ空/トップのままだと即閉じされる。
+      if (isTabLoading(tab)) continue;
       if (!liveKeys.has(key) && tab.id != null) {
         try { await chrome.tabs.remove(tab.id); closed += 1; openKeys.delete(key); } catch (_) {}
       }
@@ -90,7 +87,7 @@ async function syncRooms() {
         blocked.add(row.key);
         ignoredIn += 1;
         const tab = openKeys.get(row.key);
-        if (tab && tab.id != null) {
+        if (tab && tab.id != null && !isTabLoading(tab)) {
           try { await chrome.tabs.remove(tab.id); closed += 1; openKeys.delete(row.key); } catch (_) {}
         }
         machine.openQueue = machine.openQueue.filter((k) => k !== row.key);
@@ -113,22 +110,31 @@ async function syncRooms() {
   blocked = ignoreSet(state.ignoreList);
   pruneQueue(liveKeys, blocked);
   for (const [key, tab] of [...openKeys]) {
-    if (blocked.has(key) && tab.id != null) {
+    if (blocked.has(key) && tab.id != null && !isTabLoading(tab)) {
       try { await chrome.tabs.remove(tab.id); closed += 1; openKeys.delete(key); } catch (_) {}
     }
   }
+  await drainOpenQueueBurst(8000);
+  const afterOpen = await currentOpenKeys();
+  for (const [key, tab] of afterOpen) openKeys.set(key, tab);
   const moved = await gatherRoomTabsToWindow();
   const liveTabs = [];
   for (const room of lives) {
     if (blocked.has(room.key)) continue;
-    const tab = openKeys.get(room.key);
+    const tab = openKeys.get(room.key) || afterOpen.get(room.key);
     if (tab && tab.id != null) liveTabs.push({ id: tab.id, key: room.key });
   }
   const rotateMs = liveTabs.length * viewMs;
   const cycleMs = Math.max(minCycleMs, rotateMs);
   state.prevLiveCount = liveCount;
   await saveState(state);
-  await setStatus(stamp + " 配信" + liveCount + " / キュー" + opened + "残" + machine.openQueue.length + " / 閉じる" + closed + " / 移動" + moved + " / 無視+" + ignoredIn + " / 無視戻し" + ignoredOut + " / 無視中" + state.ignoreList.length + " / 次取得 " + Math.round(cycleMs / 1000) + "秒");
+  const winNote = s.dedicatedWindow === false
+    ? "窓オフ"
+    : (await getStoredWindowId())
+      ? "窓あり"
+      : ("窓なし" + (machine.lastWindowError ? " " + machine.lastWindowError : ""));
+  const openNote = machine.lastOpenError ? " / 開く失敗 " + machine.lastOpenError : "";
+  await setStatus(stamp + " 配信" + liveCount + " / 開いた" + openKeys.size + " / 予約" + machine.openQueue.length + " / 閉じる" + closed + " / 移動" + moved + " / " + winNote + " / 無視+" + ignoredIn + " / 無視戻し" + ignoredOut + " / 無視中" + state.ignoreList.length + " / 次取得 " + Math.round(cycleMs / 1000) + "秒" + openNote);
   return { liveTabs, cycleMs, viewMs, rotateEnabled: s.rotateEnabled !== false && liveTabs.length > 0 };
 }
 
