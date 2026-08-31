@@ -10,7 +10,7 @@ const ROOM_BASE = "https://www.showroom-live.com/";
 const RESERVED = new Set(["", "r", "api", "onlive", "onlives", "follow", "event", "user", "room", "login", "signup", "search", "timetable", "time_table", "campaign", "inquiry", "help", "official", "payment", "gift", "ranking", "news", "s", "settings", "setting", "mypage", "notification", "notifications"]);
 const DEFAULTS = { enabled: true, openEnabled: true, closeEnabled: true, rotateEnabled: true, dedicatedWindow: true, viewSec: 2, minCycleSec: 30, maxOpen: 20, genreId: "", unignorePerCycle: 1 };
 // Service Worker 再起動で消える。永続したい値は chrome.storage.local。
-let machine = { phase: "sync", liveTabs: [], viewIndex: 0, viewMs: 2000, cycleEnd: 0, openQueue: [], opening: new Set(), lastOpenAt: 0 };
+let machine = { phase: "sync", liveTabs: [], viewIndex: 0, viewMs: 2000, cycleEnd: 0, openQueue: [], opening: new Set(), lastOpenAt: 0, lastWindowError: "", lastOpenError: "" };
 const OPEN_GAP_MS = 400;
 
 // windowId はブラウザ再起動で無効になるので session に置く。local に残す意味はない。
@@ -29,25 +29,73 @@ async function ensureShowroomWindow() {
   // 作業ウィンドウのアクティブタブを巡回で奪わないための専用窓。
   // 「ルームタブが多い窓」を推測して再利用しない。作業窓を誤認するため。
   const s = await loadSettings();
-  if (s.dedicatedWindow === false) return null;
+  if (s.dedicatedWindow === false) {
+    machine.lastWindowError = "専用ウィンドウがオフ";
+    return null;
+  }
   const stored = await getStoredWindowId();
   const existing = await windowStillThere(stored);
-  if (existing && existing.id != null) return existing;
-  const created = await chrome.windows.create({ focused: false, type: "normal", url: "about:blank" });
-  if (!created || created.id == null) return null;
-  await setStoredWindowId(created.id);
-  return created;
+  if (existing && existing.id != null) {
+    machine.lastWindowError = "";
+    return existing;
+  }
+  // about:blank だと SW からの windows.create が即閉じることがある。トップを種にする。
+  // 初回だけ前面へ出す。見えない位置に作ると「窓が開かない」になる。
+  try {
+    const created = await chrome.windows.create({ focused: true, type: "normal", url: ROOM_BASE });
+    if (!created || created.id == null) {
+      machine.lastWindowError = "windows.create が空を返した";
+      return null;
+    }
+    await setStoredWindowId(created.id);
+    machine.lastWindowError = "";
+    return created;
+  } catch (e) {
+    machine.lastWindowError = String(e && e.message ? e.message : e);
+    return null;
+  }
+}
+function tabHref(tab) {
+  // 読み込み中は url が空で pendingUrl に行き先だけ入ることがある。
+  return (tab && (tab.pendingUrl || tab.url)) || "";
+}
+function tabRoomKey(tab) {
+  return parseRoomKey(tabHref(tab));
+}
+function isTabLoading(tab) {
+  if (!tab) return false;
+  if (tab.status === "loading") return true;
+  const url = tab.url || "";
+  if ((!url || url === "about:blank" || url === "chrome://newtab/") && tab.pendingUrl) return true;
+  return false;
+}
+function isSeedTab(tab) {
+  // 読み込み中は url が空でも種ではない。消すと「開いた直後に落ちる」。
+  if (isTabLoading(tab)) return false;
+  if (tabRoomKey(tab)) return false;
+  const u = tabHref(tab);
+  if (!u || u === "about:blank" || u === "chrome://newtab/") return true;
+  try {
+    const x = new URL(u);
+    if (!x.hostname.endsWith("showroom-live.com")) return false;
+    return !x.pathname.split("/").filter(Boolean).length;
+  } catch (_) {
+    return false;
+  }
 }
 async function pruneBlankTabs(windowId) {
-  // windows.create はタブ無しにできない。種として置いた blank を、実タブが入ってから捨てる。
-  // 最後の1枚が blank なら消さない。窓自体が閉じる。
+  // windows.create はタブ無しにできない。種として置いたトップ/blank を、実タブが入ってから捨てる。
+  // 最後の1枚が種なら消さない。窓自体が閉じる。ログイン用の予約パスは消さない。
   if (!windowId) return;
   try {
     const tabs = await chrome.tabs.query({ windowId });
-    const blanks = tabs.filter((t) => !t.url || t.url === "about:blank" || t.url === "chrome://newtab/");
-    if (!blanks.length || blanks.length >= tabs.length) return;
-    for (const tab of blanks) {
+    const readyRooms = tabs.filter((t) => tabRoomKey(t) && !isTabLoading(t));
+    if (!readyRooms.length) return;
+    const seeds = tabs.filter(isSeedTab);
+    if (!seeds.length || seeds.length >= tabs.length) return;
+    for (const tab of seeds) {
       if (tab.id == null) continue;
+      if (isTabLoading(tab)) continue;
       try { await chrome.tabs.remove(tab.id); } catch (_) {}
     }
   } catch (_) {}
@@ -69,7 +117,7 @@ async function gatherRoomTabsToWindow() {
   let moved = 0;
   for (const tab of tabs) {
     if (tab.id == null) continue;
-    if (!parseRoomKey(tab.url || "")) continue;
+    if (!tabRoomKey(tab)) continue;
     if (tab.windowId === win.id) continue;
     if (await moveTabToWindow(tab.id, win.id)) moved += 1;
   }
@@ -225,34 +273,71 @@ function pruneQueue(liveKeys, blocked) {
     if (!liveKeys.has(key) || blocked.has(key)) machine.opening.delete(key);
   }
 }
+async function listShowroomTabs() {
+  // url フィルタは読み込み中（url 未設定）を落とす。専用窓は窓IDでも拾う。
+  const byId = new Map();
+  const add = (t) => { if (t && t.id != null) byId.set(t.id, t); };
+  const patterned = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*", "https://*.showroom-live.com/*"] });
+  patterned.forEach(add);
+  const winId = await getStoredWindowId();
+  if (winId) {
+    try { (await chrome.tabs.query({ windowId: winId })).forEach(add); } catch (_) {}
+  }
+  return [...byId.values()];
+}
 async function currentOpenKeys() {
-  const tabs = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*", "https://*.showroom-live.com/*"] });
   const map = new Map();
-  for (const tab of tabs) {
-    const key = parseRoomKey(tab.url || "");
+  for (const tab of await listShowroomTabs()) {
+    const key = tabRoomKey(tab);
     if (key) map.set(key, tab);
   }
   return map;
 }
 async function closeDuplicateRoomTabs() {
-  const tabs = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*", "https://*.showroom-live.com/*"] });
   const byKey = new Map();
   let closed = 0;
-  for (const tab of tabs) {
-    const key = parseRoomKey(tab.url || "");
+  for (const tab of await listShowroomTabs()) {
+    const key = tabRoomKey(tab);
     if (!key) continue;
     if (!byKey.has(key)) byKey.set(key, [tab]);
     else byKey.get(key).push(tab);
   }
   for (const [, group] of byKey) {
     if (group.length < 2) continue;
-    const keep = group.find((t) => t.active) || group[0];
+    const keep = group.find((t) => t.status === "complete" && t.active)
+      || group.find((t) => t.status === "complete")
+      || group.find((t) => t.active)
+      || group[0];
     for (const tab of group) {
       if (tab.id == null || tab.id === keep.id) continue;
+      if (isTabLoading(tab)) continue;
       try { await chrome.tabs.remove(tab.id); closed += 1; } catch (_) {}
     }
   }
   return closed;
+}
+async function createRoomTab(key) {
+  const opts = { url: ROOM_BASE + key, active: false };
+  const win = await ensureShowroomWindow();
+  if (win && win.id != null) opts.windowId = win.id;
+  try {
+    const tab = await chrome.tabs.create(opts);
+    machine.lastOpenError = "";
+    return tab;
+  } catch (e) {
+    machine.lastOpenError = String(e && e.message ? e.message : e);
+    if (!opts.windowId) return null;
+    // 指定窓が死んでいると tabs.create は落ちる。作業窓側に退避する。
+    delete opts.windowId;
+    try {
+      const tab = await chrome.tabs.create(opts);
+      machine.lastOpenError = "専用窓に置けず作業窓へ開いた";
+      return tab;
+    } catch (e2) {
+      machine.lastOpenError = String(e2 && e2.message ? e2.message : e2);
+      return null;
+    }
+  }
 }
 async function drainOpenQueue() {
   if (!machine.openQueue.length) return false;
@@ -264,11 +349,28 @@ async function drainOpenQueue() {
   if (openKeys.has(key)) { machine.opening.delete(key); return !!machine.openQueue.length; }
   machine.opening.add(key);
   machine.lastOpenAt = now;
-  const opts = { url: ROOM_BASE + key, active: false };
-  const win = await ensureShowroomWindow();
-  if (win && win.id != null) opts.windowId = win.id;
-  try { await chrome.tabs.create(opts); } catch (_) {}
-  if (win && win.id != null) await pruneBlankTabs(win.id);
+  await createRoomTab(key);
   machine.opening.delete(key);
   return !!machine.openQueue.length;
+}
+async function drainOpenQueueBurst(budgetMs) {
+  // 予約だけ残して次の pulse に任せるると、offscreen が止まっているとき窓もタブもゼロのままになる。
+  const end = Date.now() + Math.max(0, Number(budgetMs) || 0);
+  while (machine.openQueue.length && Date.now() <= end) {
+    const before = machine.openQueue.length;
+    await drainOpenQueue();
+    if (machine.openQueue.length >= before) {
+      const wait = machine.lastOpenAt ? OPEN_GAP_MS - (Date.now() - machine.lastOpenAt) : 0;
+      if (wait > 0 && Date.now() + wait <= end) {
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      break;
+    }
+    if (machine.openQueue.length) {
+      const left = end - Date.now();
+      if (left < OPEN_GAP_MS) break;
+      await new Promise((r) => setTimeout(r, OPEN_GAP_MS));
+    }
+  }
 }
