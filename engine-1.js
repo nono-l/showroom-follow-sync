@@ -1,11 +1,81 @@
+/*
+  部品ファイル。同期ループ自体は engine-2.js。
+  ここにあるもの: 定数、巡回マシンのメモリ、専用ウィンドウ、タブ判定、Cookie 付き通信。
+*/
 const OFFSCREEN = "offscreen.html";
 const API = "https://www.showroom-live.com/api/follow/onlives";
 const CSRF_TOKEN = "https://www.showroom-live.com/api/csrf_token";
 const ROOM_BASE = "https://www.showroom-live.com/";
+// パス先頭がこれに当たる URL は配信ルームではない。専用ウィンドウへ移さない。
 const RESERVED = new Set(["", "r", "api", "onlive", "onlives", "follow", "event", "user", "room", "login", "signup", "search", "timetable", "time_table", "campaign", "inquiry", "help", "official", "payment", "gift", "ranking", "news", "s", "settings", "setting", "mypage", "notification", "notifications"]);
-const DEFAULTS = { enabled: true, openEnabled: true, closeEnabled: true, rotateEnabled: true, viewSec: 2, minCycleSec: 30, maxOpen: 20, genreId: "", unignorePerCycle: 1 };
+const DEFAULTS = { enabled: true, openEnabled: true, closeEnabled: true, rotateEnabled: true, dedicatedWindow: true, viewSec: 2, minCycleSec: 30, maxOpen: 20, genreId: "", unignorePerCycle: 1 };
+// Service Worker 再起動で消える。永続したい値は chrome.storage.local。
 let machine = { phase: "sync", liveTabs: [], viewIndex: 0, viewMs: 2000, cycleEnd: 0, openQueue: [], opening: new Set(), lastOpenAt: 0 };
 const OPEN_GAP_MS = 400;
+
+// windowId はブラウザ再起動で無効になるので session に置く。local に残す意味はない。
+async function getStoredWindowId() {
+  const { showroomWindowId } = await chrome.storage.session.get({ showroomWindowId: 0 });
+  return Number(showroomWindowId) || 0;
+}
+async function setStoredWindowId(id) {
+  await chrome.storage.session.set({ showroomWindowId: Number(id) || 0 });
+}
+async function windowStillThere(id) {
+  if (!id) return null;
+  try { return await chrome.windows.get(id); } catch (_) { return null; }
+}
+async function ensureShowroomWindow() {
+  // 作業ウィンドウのアクティブタブを巡回で奪わないための専用窓。
+  // 「ルームタブが多い窓」を推測して再利用しない。作業窓を誤認するため。
+  const s = await loadSettings();
+  if (s.dedicatedWindow === false) return null;
+  const stored = await getStoredWindowId();
+  const existing = await windowStillThere(stored);
+  if (existing && existing.id != null) return existing;
+  const created = await chrome.windows.create({ focused: false, type: "normal", url: "about:blank" });
+  if (!created || created.id == null) return null;
+  await setStoredWindowId(created.id);
+  return created;
+}
+async function pruneBlankTabs(windowId) {
+  // windows.create はタブ無しにできない。種として置いた blank を、実タブが入ってから捨てる。
+  // 最後の1枚が blank なら消さない。窓自体が閉じる。
+  if (!windowId) return;
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    const blanks = tabs.filter((t) => !t.url || t.url === "about:blank" || t.url === "chrome://newtab/");
+    if (!blanks.length || blanks.length >= tabs.length) return;
+    for (const tab of blanks) {
+      if (tab.id == null) continue;
+      try { await chrome.tabs.remove(tab.id); } catch (_) {}
+    }
+  } catch (_) {}
+}
+async function moveTabToWindow(tabId, windowId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId === windowId) return tab;
+    return await chrome.tabs.move(tabId, { windowId, index: -1 });
+  } catch (_) {
+    return null;
+  }
+}
+async function gatherRoomTabsToWindow() {
+  // 予約パスのタブは通信・ログイン用に残す。ルームキーがあるタブだけ移す。
+  const win = await ensureShowroomWindow();
+  if (!win || win.id == null) return 0;
+  const tabs = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*", "https://*.showroom-live.com/*"] });
+  let moved = 0;
+  for (const tab of tabs) {
+    if (tab.id == null) continue;
+    if (!parseRoomKey(tab.url || "")) continue;
+    if (tab.windowId === win.id) continue;
+    if (await moveTabToWindow(tab.id, win.id)) moved += 1;
+  }
+  await pruneBlankTabs(win.id);
+  return moved;
+}
 
 async function hasOffscreen() {
   if (!chrome.runtime.getContexts) return false;
@@ -65,10 +135,19 @@ function isMissingTabError(e) {
   return /No tab with id/i.test(m) || /Invalid tab ID/i.test(m) || /Receiving end does not exist/i.test(m);
 }
 async function showroomTab() {
+  // Cookie 付き fetch 用。専用窓の配信タブより、作業窓側の非ルームタブを先に使う。
+  const dedicatedId = await getStoredWindowId();
   const tabs = await chrome.tabs.query({ url: ["https://www.showroom-live.com/*"] });
+  const ranked = [];
   for (const t of tabs) {
     if (t.id == null) continue;
-    try { return await chrome.tabs.get(t.id); } catch (_) {}
+    const room = parseRoomKey(t.url || "");
+    const inDedicated = dedicatedId && t.windowId === dedicatedId;
+    ranked.push({ t, score: (room ? 2 : 0) + (inDedicated ? 1 : 0) });
+  }
+  ranked.sort((a, b) => a.score - b.score);
+  for (const row of ranked) {
+    try { return await chrome.tabs.get(row.t.id); } catch (_) {}
   }
   return chrome.tabs.create({ url: ROOM_BASE, active: false });
 }
@@ -185,7 +264,11 @@ async function drainOpenQueue() {
   if (openKeys.has(key)) { machine.opening.delete(key); return !!machine.openQueue.length; }
   machine.opening.add(key);
   machine.lastOpenAt = now;
-  try { await chrome.tabs.create({ url: ROOM_BASE + key, active: false }); } catch (_) {}
+  const opts = { url: ROOM_BASE + key, active: false };
+  const win = await ensureShowroomWindow();
+  if (win && win.id != null) opts.windowId = win.id;
+  try { await chrome.tabs.create(opts); } catch (_) {}
+  if (win && win.id != null) await pruneBlankTabs(win.id);
   machine.opening.delete(key);
   return !!machine.openQueue.length;
 }
