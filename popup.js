@@ -1,7 +1,8 @@
 /*
   ポップアップ。設定を chrome.storage.local に書き、状態文 lastStatus を表示する。
+  lastStatus が今の manifest version で始まっていなければ、旧版の残りとみなして捨てる。
 */
-const KEYS = ["enabled", "openEnabled", "closeEnabled", "rotateEnabled", "viewSec", "minCycleSec", "maxOpen", "genreId"];
+const KEYS = ["enabled", "openEnabled", "closeEnabled", "rotateEnabled", "dedicatedWindow", "viewSec", "minCycleSec", "maxOpen", "genreId"];
 
 function currentVersion() {
   return chrome.runtime.getManifest().version;
@@ -14,6 +15,7 @@ async function load() {
     openEnabled: true,
     closeEnabled: true,
     rotateEnabled: true,
+    dedicatedWindow: true,
     viewSec: 2,
     minCycleSec: 30,
     maxOpen: 20,
