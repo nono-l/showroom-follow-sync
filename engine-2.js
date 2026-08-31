@@ -1,4 +1,9 @@
+/*
+  同期と巡回の本体。engine-1.js のあとに読むこと。
+  フェーズは sync → view → wait。offscreen が pulse を打ち、ここが次の睡眠ミリ秒を返す。
+*/
 async function ensureCsrfOnce() {
+  // ブラウザ起動単位で1回。token 自体は認証ヘッダにまだ使わず、ログイン確認の印にする。
   const { csrfToken } = await chrome.storage.session.get({ csrfToken: "" });
   if (csrfToken) return { ok: true, token: csrfToken };
   try {
@@ -15,6 +20,7 @@ async function ensureCsrfOnce() {
 }
 
 async function syncRooms() {
+  // 配信一覧を取り、開く・閉じる・無視リスト・専用窓への移動までを1周でやる。
   const s = await loadSettings();
   const state = await loadState();
   const stamp = new Date().toLocaleTimeString("ja-JP");
@@ -111,6 +117,7 @@ async function syncRooms() {
       try { await chrome.tabs.remove(tab.id); closed += 1; openKeys.delete(key); } catch (_) {}
     }
   }
+  const moved = await gatherRoomTabsToWindow();
   const liveTabs = [];
   for (const room of lives) {
     if (blocked.has(room.key)) continue;
@@ -121,7 +128,7 @@ async function syncRooms() {
   const cycleMs = Math.max(minCycleMs, rotateMs);
   state.prevLiveCount = liveCount;
   await saveState(state);
-  await setStatus(stamp + " 配信" + liveCount + " / キュー" + opened + "残" + machine.openQueue.length + " / 閉じる" + closed + " / 無視+" + ignoredIn + " / 無視戻し" + ignoredOut + " / 無視中" + state.ignoreList.length + " / 次取得 " + Math.round(cycleMs / 1000) + "秒");
+  await setStatus(stamp + " 配信" + liveCount + " / キュー" + opened + "残" + machine.openQueue.length + " / 閉じる" + closed + " / 移動" + moved + " / 無視+" + ignoredIn + " / 無視戻し" + ignoredOut + " / 無視中" + state.ignoreList.length + " / 次取得 " + Math.round(cycleMs / 1000) + "秒");
   return { liveTabs, cycleMs, viewMs, rotateEnabled: s.rotateEnabled !== false && liveTabs.length > 0 };
 }
 
@@ -200,4 +207,10 @@ chrome.runtime.onMessage.addListener((msg, _s, send) => {
     return true;
   }
 });
+if (chrome.windows && chrome.windows.onRemoved) {
+  chrome.windows.onRemoved.addListener(async (id) => {
+    const stored = await getStoredWindowId();
+    if (stored === id) await setStoredWindowId(0);
+  });
+}
 ensureOffscreen();
