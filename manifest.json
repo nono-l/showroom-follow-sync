@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SHOWROOM フォローオンライブ同期",
-  "version": "1.5.0",
+  "version": "1.5.2",
   "description": "フォロー中配信を専用ウィンドウに集め、2秒ずつ巡回し、終了タブを閉じる",
   "icons": {
     "16": "img/icon.png",
